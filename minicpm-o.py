@@ -79,20 +79,36 @@ class GGUFMiniCPMModel:
 
         print("[MODEL] Initializing GGUF MiniCPM-o model via llama-cpp-python ...")
         print(f"[MODEL]   model_path      = {model_path}")
-        if clip_model_path:
-            print(f"[MODEL]   clip_model_path = {clip_model_path}")
         print(f"[MODEL]   n_ctx={n_ctx}, n_gpu_layers={n_gpu_layers}")
+
+        # NOTE: llama-cpp-python 0.3.16 does NOT support MiniCPM-o 4.5 vision encoder
+        # (minicpmv_version=100045).  Both native clip_model_path pass-through and
+        # MiniCPMv26ChatHandler (via mtmd) crash on this model version.
+        # Vision/image features are disabled until a newer llama-cpp-python release
+        # adds support.  Text-only chat works perfectly.
+        self.vision_supported = False
+        if clip_model_path:
+            print(f"[MODEL]   clip_model_path = {clip_model_path}  (NOT loaded — unsupported by llama-cpp-python {self._lcpp_version()})")
+            print("[MODEL]   ⚠️  Vision disabled: minicpmv_version 100045 not yet supported.")
+            print("[MODEL]   ⚠️  Image uploads will be described as text; upgrade llama-cpp-python when available.")
 
         import time as _t
         t0 = _t.time()
         self.llm = Llama(
             model_path=model_path,
-            clip_model_path=clip_model_path,
             n_ctx=n_ctx,
             n_gpu_layers=n_gpu_layers,
             verbose=True,
         )
         print(f"[MODEL] GGUF model loaded in {_t.time() - t0:.1f}s")
+
+    @staticmethod
+    def _lcpp_version() -> str:
+        try:
+            import llama_cpp
+            return getattr(llama_cpp, '__version__', 'unknown')
+        except Exception:
+            return 'unknown'
 
     # ---- compat helpers ----
 
@@ -110,26 +126,30 @@ class GGUFMiniCPMModel:
 
     def _convert_msgs(self, msgs):
         """
-        MiniCPM format -> OpenAI vision chat format.
-        MiniCPM:  {"role":"user","content": [PIL_img, "text"]}
-        OpenAI:   {"role":"user","content": [{"type":"image_url",...}, {"type":"text",...}]}
+        Convert MiniCPM-format messages to plain-text messages for GGUF.
+
+        Because llama-cpp-python 0.3.16 cannot process MiniCPM-o 4.5 vision
+        (minicpmv_version 100045), we strip PIL images and keep only text.
+        The Jinja2 chat template inside the GGUF requires content to be a
+        plain string; passing a list crashes with 'list has no startswith'.
         """
         converted = []
         for msg in msgs:
             role = msg["role"]
             content = msg["content"]
             if isinstance(content, list):
-                parts = []
+                # Extract text parts only; images are not supported in GGUF mode
+                text_parts = []
+                has_image = False
                 for item in content:
                     if isinstance(item, Image.Image):
-                        uri = self._pil_to_data_uri(item)
-                        parts.append({
-                            "type": "image_url",
-                            "image_url": {"url": uri},
-                        })
+                        has_image = True
                     elif isinstance(item, str):
-                        parts.append({"type": "text", "text": item})
-                converted.append({"role": role, "content": parts})
+                        text_parts.append(item)
+                if has_image:
+                    print("[MODEL] ⚠️  Image stripped from message (vision not supported in GGUF mode)")
+                final_text = "\n".join(text_parts).strip() or "Describe what you see."
+                converted.append({"role": role, "content": final_text})
             else:
                 converted.append({"role": role, "content": str(content)})
         return converted
@@ -839,10 +859,16 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
     # UI should only store text, not raw PIL
     ui_user_content = user_text if user_text else ("[image]" if pil_img is not None else "")
 
+    # GGUF mode: vision not supported — warn user and degrade to text-only
+    vision_warning = ""
+    if pil_img is not None and hasattr(model, 'vision_supported') and not model.vision_supported:
+        vision_warning = "\n\n> ⚠️ **图片已接收但无法视觉处理** — 当前 GGUF 模式不支持图像识别 (llama-cpp-python 未支持 MiniCPM-o 4.5 vision)。仅处理文本内容。"
+        pil_img = None  # drop the image to avoid downstream crash
+
     if pil_img is not None:
         mm_content = [pil_img, user_text if user_text else "Describe this image."]
     else:
-        mm_content = user_text
+        mm_content = user_text or "Hello"
 
     msgs_state = msgs_state or []
     max_turns = int(max_turns) if max_turns is not None else 20
@@ -881,7 +907,7 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
         # Update UI chat (messages format)
         chat_ui_msgs = _as_messages(chat_ui)
         chat_ui_msgs.append({"role": "user", "content": ui_user_content})
-        chat_ui_msgs.append({"role": "assistant", "content": response_text})
+        chat_ui_msgs.append({"role": "assistant", "content": vision_warning + response_text if vision_warning else response_text})
 
         audio_path = None
         new_last_audio = last_audio_state
@@ -1028,10 +1054,18 @@ def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
 
 
     ui_user_content = user_text if user_text else ("[image]" if pil_img is not None else "")
+
+    # GGUF mode: vision not supported — warn user and degrade to text-only
+    vision_prefix = ""
+    _model = get_minicpm_model()
+    if pil_img is not None and hasattr(_model, 'vision_supported') and not _model.vision_supported:
+        vision_prefix = "> \u26a0\ufe0f **\u56fe\u7247\u5df2\u63a5\u6536\u4f46\u65e0\u6cd5\u89c6\u89c9\u5904\u7406** \u2014 \u5f53\u524d GGUF \u6a21\u5f0f\u4e0d\u652f\u6301\u56fe\u50cf\u8bc6\u522b\u3002\u4ec5\u5904\u7406\u6587\u672c\u5185\u5bb9\u3002\n\n"
+        pil_img = None  # drop the image
+
     chat_ui_msgs.append({"role": "user", "content": ui_user_content})
 
     # Add placeholder assistant message we will update as we stream
-    chat_ui_msgs.append({"role": "assistant", "content": ""})
+    chat_ui_msgs.append({"role": "assistant", "content": vision_prefix})
 
 
     # ---- stream from agent ----
@@ -1039,7 +1073,7 @@ def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
     spoken_upto = 0
 
     for partial in agent.stream_chat(mm_state, user_text=user_text, default_tokens = max_tokens , max_turns=max_turns, user_image=pil_img):
-        chat_ui_msgs[-1]["content"] = partial
+        chat_ui_msgs[-1]["content"] = vision_prefix + partial
 
         if speak_back and len(partial) > spoken_upto:
             pending = partial[spoken_upto:]
