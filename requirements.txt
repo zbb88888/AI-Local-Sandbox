@@ -13,7 +13,7 @@ numpy
 pillow==10.4.0
 soundfile>=0.13.0
 pydub>=0.25.1
-piper-tts==1.4.1
+edge-tts>=7.0.0
 pathvalidate==3.3.1
 faster-whisper==1.2.1
 ctranslate2==4.7.1

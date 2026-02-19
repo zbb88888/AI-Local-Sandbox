@@ -24,9 +24,7 @@ PYTHON     := $(VENV_DIR)/bin/python
 PIP        := $(VENV_DIR)/bin/pip
 PORT       := 7860
 
-PIPER_DIR  := $(HOME)/piper_voices/libritts_r_medium
-PIPER_ONNX := $(PIPER_DIR)/en_US-libritts_r-medium.onnx
-PIPER_JSON := $(PIPER_DIR)/en_US-libritts_r-medium.onnx.json
+# TTS: edge-tts (online, Microsoft Edge Neural voices — no local model files needed)
 
 # PyTorch CUDA wheel index (change cu121 → cu124 etc. if needed)
 TORCH_INDEX := https://download.pytorch.org/whl/cu121
@@ -119,7 +117,7 @@ install-cuda-toolkit: ## Install CUDA Toolkit (nvcc) — requires sudo
 	@echo -e "$(_GREEN)[SYS]$(_RESET) CUDA Toolkit installed. Now run: make install-gguf"
 
 .PHONY: install-all
-install-all: install-system install-torch install install-gguf install-piper-voice ## Full setup: system + PyTorch + deps + GGUF wheel + Piper voice
+install-all: install-system install-torch install install-gguf ## Full setup: system + PyTorch + deps + GGUF wheel
 
 .PHONY: install-system
 install-system: ## Install system-level packages (ffmpeg, etc.) — requires sudo
@@ -127,15 +125,8 @@ install-system: ## Install system-level packages (ffmpeg, etc.) — requires sud
 	sudo apt update && sudo apt install -y ffmpeg python3-venv
 	@echo -e "$(_GREEN)[SYS]$(_RESET) System packages installed."
 
-.PHONY: install-piper-voice
-install-piper-voice: ## Download default Piper TTS voice model
-	@echo -e "$(_CYAN)[TTS]$(_RESET) Downloading Piper voice to $(PIPER_DIR) ..."
-	mkdir -p $(PIPER_DIR)
-	wget -q --show-progress -O $(PIPER_ONNX) \
-		https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/libritts_r/medium/en_US-libritts_r-medium.onnx
-	wget -q --show-progress -O $(PIPER_JSON) \
-		https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/libritts_r/medium/en_US-libritts_r-medium.onnx.json
-	@echo -e "$(_GREEN)[TTS]$(_RESET) Piper voice ready."
+# edge-tts has no local model files — voices are streamed from Microsoft servers.
+# No install-piper-voice target needed.
 
 .PHONY: freeze
 freeze: venv ## Regenerate requirements.lock.txt from current venv

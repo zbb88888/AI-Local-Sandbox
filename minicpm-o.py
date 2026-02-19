@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from collections import OrderedDict
 import re
 import wave
+import asyncio
 from queue import Queue, Empty
 from threading import Thread, Event
 
@@ -400,8 +401,8 @@ def transcribe_audio(audio_path: str) -> str:
         _WHISPER = WhisperModel("small", device="cpu", compute_type="int8")
         print(f"[MODEL] Whisper STT model loaded in {time.time()-t0:.1f}s")
 
-    print(f"[MODEL] Whisper STT: transcribing {audio_path} ...")
-    segments, info = _WHISPER.transcribe(audio_path, beam_size=5, vad_filter=True)
+    print(f"[MODEL] Whisper STT: transcribing {audio_path} (language=zh) ...")
+    segments, info = _WHISPER.transcribe(audio_path, beam_size=5, vad_filter=True, language="zh")
     text = "".join(seg.text for seg in segments).strip()
     if not text:
         return "(no speech detected)"
@@ -410,27 +411,46 @@ def transcribe_audio(audio_path: str) -> str:
 
 
 # -----------------------------
-# Voice: Text-to-Speech (CPU)
+# Voice: Text-to-Speech (edge-tts, online)
 # -----------------------------
 
-# Path to the LibriTTS voice
-PIPER_VOICE = os.path.expanduser("~/piper_voices/libritts_r_medium/en_US-libritts_r-medium.onnx")
+# Microsoft Edge Neural TTS voice for Chinese
+# Full voice list: edge-tts --list-voices
+EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "zh-CN-liaoning-XiaobeiNeural")
 
 def tts_to_wav(text: str) -> str:
     """
-    Generate speech audio (offline) using Piper voice.
+    Generate speech audio using Microsoft Edge Neural TTS (edge-tts).
+    Requires internet connection. Outputs WAV PCM16 via ffmpeg transcode.
     """
-    out_wav = os.path.join(tempfile.gettempdir(), f"minicpm_tts_{int(time.time()*1000)}.wav")
+    import edge_tts
 
-    cmd = [
-        "piper",
-        "--model", PIPER_VOICE,
-        "--output_file", out_wav,
-    ]
+    ts = int(time.time() * 1000)
+    out_mp3 = os.path.join(tempfile.gettempdir(), f"minicpm_tts_{ts}.mp3")
+    out_wav = os.path.join(tempfile.gettempdir(), f"minicpm_tts_{ts}.wav")
 
-    print(f"[MODEL] Piper TTS: generating speech ({len(text)} chars) → {out_wav}")
-    # Piper takes input text from stdin
-    subprocess.run(cmd, input=text.encode("utf-8"), check=True)
+    print(f"[MODEL] edge-tts ({EDGE_TTS_VOICE}): generating speech ({len(text)} chars)")
+
+    async def _synthesize():
+        comm = edge_tts.Communicate(text, EDGE_TTS_VOICE)
+        await comm.save(out_mp3)
+
+    # Always create a fresh event loop — safe from any thread
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_synthesize())
+    finally:
+        loop.close()
+
+    # Transcode mp3 → wav PCM16 (required by downstream pipeline)
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-i", out_mp3,
+         "-acodec", "pcm_s16le", "-ar", "24000", "-ac", "1",
+         out_wav],
+        check=True,
+    )
+    os.remove(out_mp3)
 
     return out_wav
 
@@ -452,7 +472,8 @@ def should_speak(buf: str) -> bool:
     s = (buf or "").strip()
     if len(s) >= 180:
         return True
-    return s.endswith((".", "!", "?"))
+    # Support both English and Chinese sentence-ending punctuation
+    return s.endswith((".", "!", "?", "\u3002", "\uff01", "\uff1f"))
 
 
 
