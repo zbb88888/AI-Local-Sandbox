@@ -56,12 +56,15 @@ def get_minicpm_model():
         return _MODEL
 
     model_id = "openbmb/MiniCPM-V-4_5-int4"
+    print(f"[MODEL] Loading MiniCPM model: {model_id} (INT4, fp16, device_map=auto) ...")
+    t0 = time.time()
     _MODEL = AutoModel.from_pretrained(
         model_id,
         trust_remote_code=True,
         torch_dtype=torch.float16,
         device_map="auto",   # IMPORTANT
     ).eval()
+    print(f"[MODEL] MiniCPM model loaded in {time.time()-t0:.1f}s — device_map=auto")
     return _MODEL
 
 def get_minicpm_tokenizer():
@@ -70,10 +73,12 @@ def get_minicpm_tokenizer():
         return _TOKENIZER
 
     model_id = "openbmb/MiniCPM-V-4_5-int4"
+    print(f"[MODEL] Loading MiniCPM tokenizer: {model_id} ...")
     _TOKENIZER = AutoTokenizer.from_pretrained(
         model_id,
         trust_remote_code=True,
     )
+    print(f"[MODEL] MiniCPM tokenizer loaded.")
     return _TOKENIZER
 
 
@@ -202,6 +207,9 @@ class MiniCPMAgent:
         # STREAMING: model.chat(stream=True) usually yields text fragments for MiniCPM-style repos.
         # If it returns a generator of dicts, we handle that too.
         acc = ""
+        has_img = active_image_id is not None
+        print(f"[INFER] MiniCPM stream_chat: max_tokens={default_tokens}, history={len(state.msgs)} msgs, image={'yes' if has_img else 'no'}")
+        t0 = time.time()
         try:
             out = self.model.chat(
                 msgs=state.msgs,
@@ -231,6 +239,8 @@ class MiniCPMAgent:
                     yield acc
 
         finally:
+            elapsed = time.time() - t0
+            print(f"[INFER] MiniCPM stream_chat done in {elapsed:.1f}s, output_len={len(acc)} chars")
             # Save final assistant message to model state
             if acc.strip():
                 state.msgs.append({"role": "assistant", "content": acc})
@@ -259,8 +269,12 @@ def transcribe_audio(audio_path: str) -> str:
 
     if _WHISPER is None:
         # "small" is a good speed/quality tradeoff on CPU
+        print("[MODEL] Loading Whisper STT model: faster-whisper 'small' (CPU, int8) ...")
+        t0 = time.time()
         _WHISPER = WhisperModel("small", device="cpu", compute_type="int8")
+        print(f"[MODEL] Whisper STT model loaded in {time.time()-t0:.1f}s")
 
+    print(f"[MODEL] Whisper STT: transcribing {audio_path} ...")
     segments, info = _WHISPER.transcribe(audio_path, beam_size=5, vad_filter=True)
     text = "".join(seg.text for seg in segments).strip()
     if not text:
@@ -273,7 +287,7 @@ def transcribe_audio(audio_path: str) -> str:
 # Voice: Text-to-Speech (CPU)
 # -----------------------------
 
-# Path to the LibriTTS voice 
+# Path to the LibriTTS voice
 PIPER_VOICE = os.path.expanduser("~/piper_voices/libritts_r_medium/en_US-libritts_r-medium.onnx")
 
 def tts_to_wav(text: str) -> str:
@@ -281,16 +295,17 @@ def tts_to_wav(text: str) -> str:
     Generate speech audio (offline) using Piper voice.
     """
     out_wav = os.path.join(tempfile.gettempdir(), f"minicpm_tts_{int(time.time()*1000)}.wav")
-    
+
     cmd = [
         "piper",
         "--model", PIPER_VOICE,
         "--output_file", out_wav,
     ]
-    
+
+    print(f"[MODEL] Piper TTS: generating speech ({len(text)} chars) → {out_wav}")
     # Piper takes input text from stdin
     subprocess.run(cmd, input=text.encode("utf-8"), check=True)
-    
+
     return out_wav
 
 
@@ -349,7 +364,7 @@ class TTSWavQueue:
             return self.ready_q.get_nowait()
         except Empty:
             return None
-    
+
     def end_turn(self):
         self.job_q.put(self.SENTINEL)
 
@@ -505,12 +520,15 @@ def get_sd_pipeline():
     # A fast/small-ish option. You can change this to another SD checkpoint.
     sd_id = "stabilityai/sd-turbo"
 
+    print(f"[MODEL] Loading SD Text2Image pipeline: {sd_id} (fp16) ...")
+    t0 = time.time()
     pipe = AutoPipelineForText2Image.from_pretrained(
         sd_id,
         torch_dtype=torch.float16,
         variant="fp16",
     )
     pipe = pipe.to("cpu")
+    print(f"[MODEL] SD Text2Image pipeline loaded in {time.time()-t0:.1f}s — parked on CPU")
     _SD = pipe
     return pipe
 
@@ -520,6 +538,8 @@ def generate_image(prompt: str, steps: int = 4, width: int = 512, height: int = 
     if pipe is None:
         return None
 
+    print(f"[INFER] SD Text2Image: prompt='{prompt[:60]}...', steps={steps}, {width}x{height}")
+    t0 = time.time()
     if torch.cuda.is_available():
         pipe.to("cuda")
 
@@ -536,6 +556,7 @@ def generate_image(prompt: str, steps: int = 4, width: int = 512, height: int = 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    print(f"[INFER] SD Text2Image done in {time.time()-t0:.1f}s")
     return img
 
 
@@ -553,11 +574,14 @@ def get_sd_refine_pipeline():
     from diffusers import AutoPipelineForImage2Image
 
     sd_id = "stabilityai/sd-turbo"  # start simple; can swap later for higher-quality checkpoint
+    print(f"[MODEL] Loading SD Image2Image (refine) pipeline: {sd_id} (fp16) ...")
+    t0 = time.time()
     pipe = AutoPipelineForImage2Image.from_pretrained(
         sd_id,
         torch_dtype=torch.float16,
         variant="fp16",
     )
+    print(f"[MODEL] SD Image2Image pipeline loaded in {time.time()-t0:.1f}s — parked on CPU")
 
     # helps VRAM a bit
     try:
@@ -578,6 +602,8 @@ def refine_image(img: Image.Image, prompt: str, steps: int = 20, strength: float
     if pipe is None or img is None:
         return None
 
+    print(f"[INFER] SD Image2Image refine: prompt='{prompt[:60]}...', steps={steps}, strength={strength}, cfg={guidance}")
+    t0 = time.time()
     if torch.cuda.is_available():
         pipe.to("cuda")
 
@@ -594,6 +620,7 @@ def refine_image(img: Image.Image, prompt: str, steps: int = 20, strength: float
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    print(f"[INFER] SD Image2Image refine done in {time.time()-t0:.1f}s")
     return out
 
 
@@ -601,15 +628,8 @@ def refine_image(img: Image.Image, prompt: str, steps: int = 20, strength: float
 
 
 
-
-
-
-
-
-
-
 # -----------------------------
-# Chat function 
+# Chat function
 # -----------------------------
 def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume_val, last_audio_state,is_reversed_state, max_tokens, max_turns):
 
@@ -692,6 +712,8 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
 
     try:
         # IMPORTANT: pass tokenizer=tokenizer exactly like the HF README
+        print(f"[INFER] MiniCPM chat_step (final): max_tokens={max_tokens}, history={len(msgs_state)} msgs")
+        _t0 = time.time()
         response_text = model.chat(
             msgs=msgs_state,
             tokenizer=tokenizer,
@@ -704,6 +726,7 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
             use_image_id=False
         )
 
+        print(f"[INFER] MiniCPM chat_step (final) done in {time.time()-_t0:.1f}s, output_len={len(response_text)} chars")
         # Update model state
         msgs_state.append({"role": "assistant", "content": response_text})
         msgs_state = _trim_history_safe(msgs_state, max_turns=max_turns)
@@ -726,10 +749,10 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
             new_is_reversed = False
 
 
-        
+
         return chat_ui_msgs, msgs_state, "", audio_path, new_last_audio, new_is_reversed
 
-    
+
 
 
     except torch.OutOfMemoryError:
@@ -785,11 +808,11 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
 
 def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
                      speak_back, tts_volume_val,
-                     last_audio_state, is_reversed_state, tts_queue_state, 
+                     last_audio_state, is_reversed_state, tts_queue_state,
                      playing_until_state, max_tokens, max_turns):
     audio_accum = []   # list of np.float32 chunks
- 
-    
+
+
     # ---- UI normalize ----
     def _as_messages(x):
         if x is None:
@@ -841,7 +864,7 @@ def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
 
     if not isinstance(mm_state, MMState):
         mm_state = MMState()
-        
+
     yield (
         chat_ui_msgs,
         mm_state,
@@ -931,7 +954,7 @@ def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
         time.sleep(0.02)
 
 
- 
+
     full_path = concat_wavs_flexible(audio_accum)
     last_audio_state = full_path or last_audio_state
     is_reversed_state = False
@@ -1001,7 +1024,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
 
         """
     )
-    
+
     msgs_state = gr.State([])  # MiniCPM messages
     mm_state = gr.State(None)
     agent = MiniCPMAgent()
@@ -1021,7 +1044,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
     with gr.Blocks():
         # Horizontal line separator
          gr.HTML("<hr style='border: 1px solid #bbb; margin: 20px 0;'>")
-   
+
     with gr.Row():
         reverse_btn = gr.Button("Reverse Audio", variant="huggingface")
         send_btn_stream = gr.Button("Send", variant="primary", visible=True)
@@ -1029,10 +1052,10 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
 
         send_btn= gr.Button("Send", variant="primary", visible=False)
         clear_btn = gr.Button("Clear",variant="stop", visible=False)
-        
-        
-        
-  
+
+
+
+
 
     out_audio = gr.Audio(label="Assistant voice", autoplay=True, visible=False)
     out_audio_stream = gr.Audio(streaming=True, autoplay=True, label="Streaming TTS", visible=True)
@@ -1063,7 +1086,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
         with gr.Column(scale=0.2):
             voice_enabled = gr.Checkbox(value=False, label="Voice input (mic) enabled")
 
-        
+
 
 
     with gr.Blocks():
@@ -1073,12 +1096,12 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
 
 
 
-    # State Changes 
+    # State Changes
     # -----------------------------------
-    last_audio_state = gr.State(None)        
-    is_reversed_state = gr.State(False)       
-    tts_queue_state = gr.State(None)   
-    playing_until_state = gr.State(0.0) 
+    last_audio_state = gr.State(None)
+    is_reversed_state = gr.State(False)
+    tts_queue_state = gr.State(None)
+    playing_until_state = gr.State(0.0)
     # -----------------------------------
 
 
@@ -1116,10 +1139,10 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
         mic_stream = None
         last_audio_state = None
         is_reversed_state = None
-        tts_queue_state = None 
+        tts_queue_state = None
         playing_until_state = None
         return chat_ui, mm_state, user_text_stream, out_audio_stream , user_image, mic_stream, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state
-    
+
 
     def _clear():
         chat_ui = []
@@ -1131,7 +1154,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
         last_audio_state = None
         is_reversed_state = None
         return chat_ui, msgs_state, user_text, out_audio, user_image, mic, last_audio_state, is_reversed_state
-    
+
 
     def _clear_img():
         gen_img_out = None
@@ -1142,7 +1165,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
     def apply_visibility(mode_val, voice_on):
         is_stream = (mode_val == "stream")
         voice_on = bool(voice_on)
-    
+
 
         return (
             # textboxes
@@ -1160,12 +1183,12 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             gr.update(visible=not is_stream),    # clear_btn
 
             gr.update(visible=voice_on),         # Mic Mardown Text
-            
-            # audio players 
+
+            # audio players
             gr.update(visible=not is_stream, value=None),   # out_audio (file)
             gr.update(visible=is_stream, value=None),       # out_audio_stream (streaming)
 
-            gr.update(value=False),                 # is_reversed_state 
+            gr.update(value=False),                 # is_reversed_state
         )
 
 
@@ -1183,7 +1206,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
         inputs=[chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume, last_audio_state, is_reversed_state, max_tokens, max_turns],
         outputs=[chat_ui, msgs_state, user_text, out_audio, last_audio_state, is_reversed_state],
     )
-    
+
 
     send_btn_stream.click(
         fn=chat_step_stream,
@@ -1225,7 +1248,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             tts_volume,
             last_audio_state,
             is_reversed_state,
-            max_tokens, 
+            max_tokens,
             max_turns
         ],
         outputs=[
@@ -1254,9 +1277,9 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             tts_volume,
             last_audio_state,
             is_reversed_state,
-            tts_queue_state, 
+            tts_queue_state,
             playing_until_state,
-            max_tokens, 
+            max_tokens,
             max_turns
         ],
         outputs=[
@@ -1267,7 +1290,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             out_audio_stream ,
             last_audio_state,
             is_reversed_state,
-            tts_queue_state, 
+            tts_queue_state,
             playing_until_state
         ],
     )
@@ -1295,7 +1318,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
     clear_btn.click(
         fn=_clear,
         inputs=[],
-        outputs=[chat_ui, msgs_state, user_text, out_audio, user_image, mic, last_audio_state, is_reversed_state],   
+        outputs=[chat_ui, msgs_state, user_text, out_audio, user_image, mic, last_audio_state, is_reversed_state],
     )
 
     clear_btn_img.click(
@@ -1324,7 +1347,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             text_markdown_speech,
             out_audio, out_audio_stream,
             is_reversed_state,
-        
+
         ],
     )
 
@@ -1339,7 +1362,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             text_markdown_speech,
             out_audio, out_audio_stream,
             is_reversed_state,
-     
+
         ],
     )
 
