@@ -124,3 +124,71 @@ subprocess.run(["piper", "--model", voice_path, "--output_file", out_wav], input
 5. **跳过本地模型加载**：API 模式下不加载 HF 权重，释放全部 GPU VRAM
 
 这属于 **新功能开发**，当前代码库中不包含此能力。
+---
+
+## GGUF 入口：`python minicpm-o.py`
+
+`minicpm-o.py` 已改造为使用 **GGUF 量化模型**，通过 `llama-cpp-python` 加载，替代原有的 HuggingFace AutoModel。
+
+### GGUF 模型配置
+
+| 配置项 | 值 |
+|--------|------|
+| HuggingFace 仓库 | `openbmb/MiniCPM-o-4_5-gguf` |
+| **默认 LLM 文件** | `MiniCPM-o-4_5-Q4_K_M.gguf` (5.03GB) |
+| 备选 LLM 文件 | `MiniCPM-o-4_5-Q4_K_S.gguf` (4.80GB) |
+| Vision Projector | `vision/MiniCPM-o-4_5-vision-F16.gguf` (1.1GB) |
+| 架构 | Qwen3 8B params |
+| Context 长度 | 4096 tokens |
+| GPU Offload | 全部层 (`n_gpu_layers=-1`) |
+
+### Q4_K_M vs Q4_K_S
+
+- **Q4_K_M (推荐)**：混合精度量化，attention 和 feed_forward 关键层使用 Q6_K，视觉理解质量更优。
+- **Q4_K_S**：全部使用 Q4_K 量化，节省约 230MB VRAM，质量略低。仅在 VRAM 极度紧张时切换。
+
+切换方式：编辑 `minicpm-o.py` 顶部配置常量即可：
+
+```python
+# 默认 Q4_K_M
+GGUF_MODEL_FILE = "MiniCPM-o-4_5-Q4_K_M.gguf"
+# 切换为 Q4_K_S：注释上面一行，取消下面一行的注释
+# GGUF_MODEL_FILE = "MiniCPM-o-4_5-Q4_K_S.gguf"
+```
+
+### 额外依赖
+
+```bash
+# CUDA GPU 加速版
+CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
+# 或 CPU-only 版
+pip install llama-cpp-python
+# huggingface_hub 用于自动下载 GGUF 文件
+pip install huggingface_hub
+```
+
+### 调用链
+
+```
+python minicpm-o.py
+  → get_minicpm_model()
+    → hf_hub_download(Q4_K_M.gguf + vision-F16.gguf)
+    → GGUFMiniCPMModel.__init__()
+      → llama_cpp.Llama(model_path=..., clip_model_path=...)
+  → GGUFMiniCPMModel.chat(msgs, stream=True)
+    → _convert_msgs(): MiniCPM [PIL, text] → OpenAI vision base64 format
+    → llm.create_chat_completion(messages=..., stream=True)
+    → yield text delta chunks
+```
+
+### 与原 minicpm.py 的区别
+
+| | `minicpm.py` | `minicpm-o.py` (GGUF) |
+|---|---|---|
+| 模型加载 | `AutoModel.from_pretrained()` | `llama_cpp.Llama()` |
+| 量化方式 | AWQ INT4 (HF format) | GGUF Q4_K_M / Q4_K_S |
+| 模型仓库 | `openbmb/MiniCPM-V-4_5-int4` | `openbmb/MiniCPM-o-4_5-gguf` |
+| Tokenizer | `AutoTokenizer` | 内置 (llama.cpp 处理) |
+| 依赖 | `transformers` | `llama-cpp-python` + `huggingface_hub` |
+| 视觉输入 | PIL 直接传入 | PIL → base64 data URI 转换 |
+| 其他组件 | STT/TTS/SD 不变 | STT/TTS/SD 不变 |
