@@ -99,6 +99,20 @@ subprocess.run(["piper", "--model", voice_path, "--output_file", out_wav], input
 
 ---
 
+## `python minicpm.py` 默认加载的模型清单
+
+| # | 模型名 / 路径 | HuggingFace ID | 用途 | 加载时机 | 设备 |
+|---|--------------|----------------|------|----------|------|
+| 1 | MiniCPM-V-4.5-int4 | `openbmb/MiniCPM-V-4_5-int4` | 多模态聊天（LLM + Vision） | **启动时立即加载**（构建 UI 时实例化 `MiniCPMAgent`） | GPU (INT4, fp16, device_map=auto) |
+| 2 | Whisper small | `faster-whisper` `"small"` | 语音识别（STT） | 首次使用麦克风时懒加载 | CPU (int8) |
+| 3 | Piper LibriTTS | `~/piper_voices/libritts_r_medium/en_US-libritts_r-medium.onnx` | 语音合成（TTS） | 每次 TTS 请求时 CLI 调用 | CPU (ONNX) |
+| 4 | SD Turbo (Text2Image) | `stabilityai/sd-turbo` | 图像生成 Draft | 首次点击 "Generate image" 时懒加载 | CPU↔GPU 乒乓 |
+| 5 | SD Turbo (Image2Image) | `stabilityai/sd-turbo` | 图像精炼 Refine | 首次勾选 "HD refine" 时懒加载 | CPU↔GPU 乒乓 |
+
+> 模型 4 和 5 是同一个 checkpoint，但分别加载为 Text2Image 和 Image2Image 两个独立 pipeline。
+
+---
+
 ## 如果要改为调用本地 API 服务（如 LM Studio `http://127.0.0.1:1234`）
 
 需要新增以下功能：
